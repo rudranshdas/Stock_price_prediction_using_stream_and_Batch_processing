@@ -5,6 +5,7 @@ import pickle
 import time
 from datetime import datetime, timedelta
 import os
+import pandas as pd
 
 # ================== WINDOWS CONFIGURATION ==================
 os.environ['HADOOP_HOME'] = 'C:\\hadoop'
@@ -23,149 +24,153 @@ except Exception as e:
 spark = SparkSession.builder \
     .appName("BatchStockProcessor") \
     .master("local[*]") \
-    .config("spark.jars", "file:///C:/Users/Nithin%20ramakrishnan/dbt_3_proj/mysql-connector-j-9.3.0.jar") \
-    .config("spark.driver.extraClassPath", "file:///C:/Users/Nithin%20ramakrishnan/dbt_3_proj/mysql-connector-j-9.3.0.jar") \
-    .config("spark.executor.extraClassPath", "file:///C:/Users/Nithin%20ramakrishnan/dbt_3_proj/mysql-connector-j-9.3.0.jar") \
+    .config("spark.jars", "<path to /mysql-connector-j-9.3.0.jar>") \
+    .config("spark.driver.extraClassPath", "<path to /mysql-connector-j-9.3.0.jar>") \
+    .config("spark.executor.extraClassPath", "<path to /mysql-connector-j-9.3.0.jar>") \
     .config("spark.driver.host", "127.0.0.1") \
     .config("spark.driver.bindAddress", "127.0.0.1") \
     .config("spark.executor.memory", "4g") \
     .config("spark.driver.memory", "4g") \
     .getOrCreate()
 
-# ================== MODEL CONFIGURATION ==================
-MODEL_PATH = 'lstm_model.keras'
-SCALER_PATH = 'scaler.pkl'
-
-try:
-    model = tf.keras.models.load_model(MODEL_PATH)
-    with open(SCALER_PATH, 'rb') as f:
-        scaler = pickle.load(f)
-    print("Successfully loaded model and scaler")
-except Exception as e:
-    print(f"Error loading model/scaler: {e}")
-    spark.stop()
-    exit()
-
 # Metrics tracking
 batch_times = []
-prediction_history = []
+batch_stats = {
+    'successful_runs': 0,
+    'failed_runs': 0,
+    'data_points_processed': 0,
+    'last_run_time': None
+}
 
-def predict_next_price(prices):
-    """Predict next price using the last 5 prices (aligned with streaming approach)"""
-    scaled_prices = np.array([(float(p) - scaler['min']) / (scaler['max'] - scaler['min']) for p in prices[-5:]])
-    seq = scaled_prices.reshape(1, 5, 1)
-    prediction = model.predict(seq, verbose=0)[0][0]
-    return prediction * (scaler['max'] - scaler['min']) + scaler['min']
+# Load the LSTM model once
+print("Loading LSTM model...")
+try:
+    model = tf.keras.models.load_model('lstm_model.keras')
+    print("Model loaded successfully.")
+except Exception as e:
+    print(f"Error loading model: {e}")
+    model = None
+
+def print_batch_stats():
+    print("\n=== Batch Processing Statistics ===")
+    print(f"Last run time: {batch_stats['last_run_time']}")
+    print(f"Successful runs: {batch_stats['successful_runs']}")
+    print(f"Failed runs: {batch_stats['failed_runs']}")
+    print(f"Total data points processed: {batch_stats['data_points_processed']}")
+    if batch_times:
+        print(f"\nPerformance Metrics:")
+        print(f"  Average processing time: {np.mean(batch_times):.2f}s")
+        print(f"  Minimum processing time: {np.min(batch_times):.2f}s")
+        print(f"  Maximum processing time: {np.max(batch_times):.2f}s")
+        print(f"  Total processing time: {np.sum(batch_times):.2f}s")
+    print("="*40 + "\n")
 
 def fetch_data():
-    """Fetch data with LIMIT to prevent memory issues"""
     print("\nFetching data from database...")
-    return spark.read \
+    start_time = time.time()
+    
+    df = spark.read \
         .format("jdbc") \
         .option("url", "jdbc:mysql://localhost:3306/stock_prediction") \
         .option("driver", "com.mysql.cj.jdbc.Driver") \
-        .option("dbtable", "(SELECT symbol, timestamp, price FROM stock_ticks_raw ORDER BY timestamp DESC LIMIT 1000) as tmp") \
+        .option("dbtable", "(SELECT * FROM stock_ticks_raw ORDER BY timestamp DESC LIMIT 10000) as tmp") \
         .option("user", "root") \
-        .option("password", "") \
+        .option("password", "<your password>") \
         .load()
+    
+    
+    count = df.count()
+    duration = time.time() - start_time
+    print(f"Fetched {count} records in {duration:.2f} seconds")
+    return df
 
-def process_predictions(pdf):
-    """Process predictions on the batch data"""
-    prices = pdf['price'].values
-    predictions = []
+
+def make_predictions(prices):
+    sequence_length = 60
+    sequences = []
+
+    # Use latest 60 prices for prediction (sliding window)
+    for i in range(len(prices) - sequence_length):
+        window = prices[i:i+sequence_length]
+        sequences.append(window)
+
+    sequences = np.array(sequences).reshape(-1, sequence_length, 1)
     
-    # We need at least 5 prices to make a prediction
-    if len(prices) >= 5:
-        # Make predictions for each 5-price window
-        for i in range(5, len(prices)+1):
-            window = prices[i-5:i]
-            predicted_price = predict_next_price(window)
-            predictions.append({
-                'timestamp': pdf.iloc[i-1]['timestamp'],
-                'actual_price': prices[i-1],
-                'predicted_price': predicted_price
-            })
-            
-            # Store prediction for reporting
-            prediction_history.append({
-                'timestamp': datetime.now(),
-                'prediction': predicted_price,
-                'actual': prices[i-1] if i < len(prices) else None
-            })
-    
-    return predictions
+    print(f"Running predictions on {sequences.shape[0]} sequences...")
+    preds = model.predict(sequences, verbose=0)
+    return preds.flatten()
 
 def retrain_model():
     try:
+        if model is None:
+            raise RuntimeError("Model not loaded. Cannot proceed.")
+
         start_time = time.time()
+        batch_stats['last_run_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # 1. Fetch data
         df = fetch_data()
-        pdf = df.toPandas()
-        pdf['price'] = pdf['price'].astype(float)  # Ensure float prices
-        if len(pdf) < 5:
-            print(f"Insufficient data ({len(pdf)} records), need at least 5")
-            return False
-            
-        # 2. Process predictions
-        predictions = process_predictions(pdf)
         
-        if not predictions:
-            print("No predictions made - insufficient data windows")
+        print("Converting Spark DataFrame to Pandas and sorting by timestamp...")
+        pdf = df.limit(10000).toPandas().sort_values('timestamp')
+        prices = pdf['price'].astype(float).values
+        record_count = len(prices)
+        batch_stats['data_points_processed'] += record_count
+        
+        print(f"Processing {record_count} data points...")
+
+        if len(prices) < 100:
+            print(f"Warning: Insufficient data ({len(prices)} records), minimum 100 required")
+            batch_stats['failed_runs'] += 1
             return False
-            
-        # 3. Calculate metrics
-        last_pred = predictions[-1]
+
+        chunk_size = 5000
+        print(f"Processing data in chunks of {chunk_size}...")
+
+        for i in range(0, len(prices), chunk_size):
+            chunk = prices[i:i+chunk_size]
+            print(f"Processing chunk {i//chunk_size + 1} (records {i} to {min(i+chunk_size, len(prices))})")
+            # Placeholder: Simulate processing
+
+        # Predict stock price movement using latest available data
+        if len(prices) >= 60:
+            predictions = make_predictions(prices)
+            print("Latest predictions (last 5):", predictions[-5:])
+        else:
+            print("Not enough data to generate prediction window.")
+
         duration = time.time() - start_time
         batch_times.append(duration)
+        batch_stats['successful_runs'] += 1
         
-        # 4. Print results
-        print("\n=== Prediction Results ===")
-        print(f"Last actual price: {last_pred['actual_price']:.2f}")
-        print(f"Last predicted price: {last_pred['predicted_price']:.2f}")
-        
-        if len(predictions) > 1:
-            errors = [abs(p['actual_price'] - p['predicted_price']) for p in predictions[:-1]]
-            print(f"Mean Absolute Error: {np.mean(errors):.4f}")
-            print(f"Predictions made: {len(predictions)}")
-        
-        print(f"Processing time: {duration:.2f}s")
+        print(f"Batch processing completed successfully in {duration:.2f} seconds")
         return True
         
     except Exception as e:
-        print(f"Error during processing: {str(e)}")
+        print(f"\nError during retraining: {str(e)}")
+        batch_stats['failed_runs'] += 1
         return False
+
 
 if __name__ == "__main__":
     try:
-        print("Batch prediction processor started. Press Ctrl+C to stop.")
+        print("Batch processor started. Press Ctrl+C to stop.")
         while True:
             print(f"\n{'='*40}")
             print(f"Starting new batch at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             
             if retrain_model():
-                print("\nNext batch in 1 hour...")
+                print_batch_stats()
+                print("Next retraining in 1 hour...")
+                time.sleep(60)
             else:
-                print("\nRetrying in 5 minutes...")
-                time.sleep(30)  # 5 minutes for retry
-                continue
+                print_batch_stats()
+                print("Retrying in 5 minutes...")
+                time.sleep(300)
                 
-            time.sleep(60)  # Run hourly (3600 seconds)
-            
     except KeyboardInterrupt:
-        print("\n\n=== Final Prediction Report ===")
-        print(f"Total batches processed: {len(batch_times)}")
-        if batch_times:
-            print(f"Average processing time: {np.mean(batch_times):.2f}s")
-            print(f"Total predictions made: {len(prediction_history)}")
-            
-        if prediction_history:
-            last_actual = [p['actual'] for p in prediction_history if p['actual'] is not None]
-            if last_actual:
-                errors = [abs(p['actual'] - p['prediction']) for p in prediction_history if p['actual'] is not None]
-                print(f"Overall MAE: {np.mean(errors):.4f}")
-                
-        print("\nShutting down processor...")
+        print("\n\n=== Final Batch Processing Report ===")
+        print_batch_stats()
+        print("Shutting down batch processor...")
     finally:
         spark.stop()
         print("Spark session closed")
